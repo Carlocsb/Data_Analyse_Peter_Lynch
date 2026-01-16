@@ -1,0 +1,102 @@
+# =========================
+# --- Python ---
+# =========================
+__pycache__/
+*.py[cod]
+*.pkl
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# --- Environment variables ---
+# =========================
+.env
+.env.local
+.env.*
+!.env.example
+
+# =========================
+# --- Jupyter / Temp ---
+# =========================
+.ipynb_checkpoints/
+*.ipynb
+
+# =========================
+# --- Streamlit ---
+# =========================
+.streamlit/secrets.toml
+.streamlit/cache/
+.streamlit/*.toml
+
+# =========================
+# --- Logs ---
+# =========================
+*.log
+
+# =========================
+# --- OS / Editor ---
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# --- Docker ---
+# =========================
+docker-data/
+*.pid
+*.tar
+
+# =========================
+# --- Data / API Dumps (KRITISCH) ---
+# =========================
+data/
+data/**
+*.csv
+*.json
+*.parquet
+*.feather
+*.pickle
+
+# =========================
+# --- Finance / Market Data ---
+# =========================
+*_prices.*
+*_eod.*
+*_financials.*
+*_balance*
+*_income*
+*_cashflow*
+*_ratios*
+*_profile*
+*_keymetrics*
+
+# =========================
+# --- Images / Reports ---
+# =========================
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+/images/generated/
+
+# =========================
+# --- Databases / Cache ---
+# =========================
+*.cache
+*.sqlite
+*.db
+*.duckdb
+
+# =========================
+# --- Python build ---
+# =========================
+build/
+dist/
+*.egg-info/

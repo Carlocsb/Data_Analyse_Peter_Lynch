@@ -1,0 +1,14 @@
+streamlit==1.36
+pandas>=2.0
+numpy
+openpyxl
+matplotlib
+requests
+python-dotenv>=1.0
+elasticsearch==8.15.1
+elastic-transport>=8.15,<9
+yfinance
+plotly
+seaborn
+jupyter
+ipykernel

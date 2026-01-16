@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Dependencies
+COPY code/streamlit/requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Kopiere nur die Ingestion-Skripte
+COPY code/API/ /app
+
+
+# Port ist nicht nötig – kein Webserver hier
+CMD ["python", "ingest_fmp.py"]
