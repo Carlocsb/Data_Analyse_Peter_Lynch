@@ -1,0 +1,35 @@
+{
+    "symbol": "ACS",
+    "historical": [
+        {
+            "date": "2018-02-23",
+            "open": 2.3699999,
+            "high": 2.4400001,
+            "low": 2.3699999,
+            "close": 2.3900001,
+            "adjClose": 2.3900001,
+            "volume": 39375,
+            "unadjustedVolume": 39375,
+            "change": 0.02,
+            "changePercent": 0.844,
+            "vwap": 2.4,
+            "label": "February 23, 18",
+            "changeOverTime": 0.00844
+        },
+        {
+            "date": "2018-02-20",
+            "open": 2.3699999,
+            "high": 2.4000001,
+            "low": 2.3599999,
+            "close": 2.3800001,
+            "adjClose": 2.3800001,
+            "volume": 11964,
+            "unadjustedVolume": 11964,
+            "change": 0.01,
+            "changePercent": 0.422,
+            "vwap": 2.38,
+            "label": "February 20, 18",
+            "changeOverTime": 0.00422
+        }
+    ]
+}

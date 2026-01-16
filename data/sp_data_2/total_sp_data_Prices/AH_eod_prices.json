@@ -1,0 +1,20 @@
+{
+    "symbol": "AH",
+    "historical": [
+        {
+            "date": "2016-07-25",
+            "open": 22.5781002,
+            "high": 22.5781002,
+            "low": 22.5781002,
+            "close": 22.5781002,
+            "adjClose": 22.5781002,
+            "volume": 0,
+            "unadjustedVolume": 0,
+            "change": 0,
+            "changePercent": 0,
+            "vwap": 0,
+            "label": "July 25, 16",
+            "changeOverTime": 0
+        }
+    ]
+}
