@@ -8,16 +8,16 @@ from elasticsearch import helpers
 from utils import es_client, es_healthcheck, ensure_index  # vorhanden in code/API/utils.py
 
 # === Pfade & Config ===
-BASE_DIR    = Path(__file__).resolve().parent          # .../code/API
-PROJECTROOT = BASE_DIR.parents[1]                      # .../ (Projektwurzel)
+BASE_DIR = Path(__file__).resolve().parent          # .../code/API
+PROJECTROOT = BASE_DIR.parents[1]                   # .../ (Projektwurzel)
 
-SP2_DIR     = PROJECTROOT / "data" / "sp_data_2"       # neuer Ordner (auf Höhe data/...)
+SP2_DIR = PROJECTROOT / "data" / "sp_data_2"        # neuer Ordner (auf Höhe data/...)
 BENCH_INDEX = os.getenv("ELASTICSEARCH_BENCH_INDEX", "benchmarks")  # separater Index
 
 # Welche Benchmark-Dateien sollen ingestiert werden?
 BENCH_FILES = [
-    "^GSPC_eod_prices.json",
-    
+    "^GSPC_eod_prices.json",        # FMP-Format: {"symbol":..., "historical":[...]}
+    "^SPXEW_autoadjusted.json",     # Date-Key-Format: {"YYYY-MM-DD": {"Open":..., ...}, ...}
 ]
 
 es = es_client()
@@ -37,15 +37,25 @@ def _to_iso_date(s: Any) -> Optional[str]:
         return None
     ss = str(s)[:10]
     try:
-        # "YYYY-MM-DD"
         return datetime.fromisoformat(ss).date().isoformat()
     except Exception:
         return None
 
 
+def _dataset_from_filename(file_path: Path) -> str:
+    name = file_path.name.lower()
+    if "autoadjusted" in name:
+        return "autoadjusted"
+    if "eod_prices" in name:
+        return "eod_prices"
+    return "unknown"
+
+
 def build_benchmark_actions(file_path: Path) -> List[Dict[str, Any]]:
     """
-    Erwartete Struktur:
+    Unterstützt zwei Strukturen:
+
+    A) FMP-Style:
     {
       "symbol": "^GSPC",
       "historical": [
@@ -53,60 +63,123 @@ def build_benchmark_actions(file_path: Path) -> List[Dict[str, Any]]:
         ...
       ]
     }
+
+    B) Date-Key-Style (z.B. yfinance/pandas export):
+    {
+      "2009-01-09": {"Open":..., "High":..., "Low":..., "Close":..., "Volume":...},
+      "2009-01-12": {...},
+      ...
+    }
     """
     payload = _read_json(file_path)
     if not payload or not isinstance(payload, dict):
         return []
 
-    symbol = payload.get("symbol") or file_path.stem.replace("_eod_prices", "").replace("_autoadjusted", "")
-    hist = payload.get("historical")
-
-    if not isinstance(hist, list) or not hist:
-        return []
-
-    actions: List[Dict[str, Any]] = []
+    dataset = _dataset_from_filename(file_path)
     ingested_at = datetime.now(UTC).isoformat()
 
-    for row in hist:
-        if not isinstance(row, dict):
+    # Symbol: aus payload (wenn vorhanden) sonst aus Dateiname ableiten
+    symbol = payload.get("symbol") or file_path.stem.replace("_eod_prices", "").replace("_autoadjusted", "")
+
+    actions: List[Dict[str, Any]] = []
+
+    # -----------------------------
+    # Fall A: FMP-Style (historical)
+    # -----------------------------
+    hist = payload.get("historical")
+    if isinstance(hist, list) and hist:
+        for row in hist:
+            if not isinstance(row, dict):
+                continue
+
+            d = _to_iso_date(row.get("date"))
+            if not d:
+                continue
+
+            # Primary + Fallback
+            adj = row.get("adjClose")
+            close = row.get("close")
+
+            # Wenn adjClose fehlt, nutze close als Fallback (falls vorhanden)
+            if adj is None and close is None:
+                continue
+
+            doc = {
+                "symbol": symbol,
+                "date": d,
+                "dataset": dataset,
+                "source": "local_sp_data_2",
+                "ingested_at": ingested_at,
+
+                # wichtigstes Feld (Fallback auf close)
+                "adjClose": float(adj if adj is not None else close),
+
+                # close zusätzlich speichern
+                "close": float(close) if close is not None else None,
+
+                # optional mitnehmen:
+                "open": float(row["open"]) if row.get("open") is not None else None,
+                "high": float(row["high"]) if row.get("high") is not None else None,
+                "low":  float(row["low"])  if row.get("low")  is not None else None,
+                "volume": int(row["volume"]) if row.get("volume") is not None else None,
+                "vwap": float(row["vwap"]) if row.get("vwap") is not None else None,
+                "change": float(row["change"]) if row.get("change") is not None else None,
+                "changePercent": float(row["changePercent"]) if row.get("changePercent") is not None else None,
+            }
+
+            doc = {k: v for k, v in doc.items() if v is not None}
+
+            actions.append({
+                "_op_type": "index",
+                "_index": BENCH_INDEX,
+                "_id": f"{symbol}|{d}|{dataset}",
+                "_source": doc
+            })
+
+        return actions
+
+    # ---------------------------------------
+    # Fall B: Date-Key-Style (YYYY-MM-DD keys)
+    # ---------------------------------------
+    # payload enthält KEIN "historical" => wir interpretieren die Keys als Datum
+    for date_key, row in payload.items():
+        d = _to_iso_date(date_key)
+        if not d or not isinstance(row, dict):
             continue
 
-        d = _to_iso_date(row.get("date"))
-        if not d:
-            continue
+        # yfinance/pandas keys: Open/High/Low/Close/Volume (Großschreibung!)
+        o = row.get("Open")
+        h = row.get("High")
+        l = row.get("Low")
+        c = row.get("Close")
+        v = row.get("Volume")
 
-        adj = row.get("adjClose")
-        if adj is None:
-            # User-Requirement: adjClose ist das relevante Feld
+        if c is None:
             continue
 
         doc = {
             "symbol": symbol,
             "date": d,
+            "dataset": dataset,
             "source": "local_sp_data_2",
             "ingested_at": ingested_at,
 
-            # wichtigstes Feld:
-            "adjClose": float(adj),
+            # Für autoadjusted-Dateien ist Close i.d.R. bereits adjusted -> als adjClose spiegeln
+            "adjClose": float(c),
+            "close": float(c),
 
-            # optional mitnehmen (hilfreich für Charts/Checks):
-            "open": float(row["open"]) if row.get("open") is not None else None,
-            "high": float(row["high"]) if row.get("high") is not None else None,
-            "low":  float(row["low"])  if row.get("low")  is not None else None,
-            "close": float(row["close"]) if row.get("close") is not None else None,
-            "volume": int(row["volume"]) if row.get("volume") is not None else None,
-            "vwap": float(row["vwap"]) if row.get("vwap") is not None else None,
-            "change": float(row["change"]) if row.get("change") is not None else None,
-            "changePercent": float(row["changePercent"]) if row.get("changePercent") is not None else None,
+            "open": float(o) if o is not None else None,
+            "high": float(h) if h is not None else None,
+            "low":  float(l) if l is not None else None,
+            "volume": int(v) if v is not None else None,
         }
 
-        # None-Felder entfernen (sauberer ES-Doc)
         doc = {k: v for k, v in doc.items() if v is not None}
 
         actions.append({
-            "_op_type": "index",  # idempotent: bei erneutem Lauf wird aktualisiert
+            "_op_type": "index",
             "_index": BENCH_INDEX,
-            "_id": f"{symbol}|{d}|eod",
+            "_id": f"{symbol}|{d}|{dataset}",
             "_source": doc
         })
 

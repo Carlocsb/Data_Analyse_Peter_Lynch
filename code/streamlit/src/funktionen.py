@@ -5,7 +5,7 @@ import streamlit as st
 from typing import Optional, Dict, Any
 import plotly.express as px
 from datetime import datetime, timezone
-
+import re
 from .lynch_criteria import CATEGORIES
 
 # ==========================================================
@@ -19,11 +19,6 @@ INDEX  = os.getenv("ELASTICSEARCH_INDEX", "stocks")
 def _ensure_list(x):
     return x if isinstance(x, (list, tuple)) else [x]
 
-def _first_nonempty(*dfs):
-    for d in dfs:
-        if isinstance(d, pd.DataFrame) and not d.empty:
-            return d
-    return pd.DataFrame()
 
 def _merge_asof_two(left: pd.DataFrame, right: pd.DataFrame):
     """Expects columns ['Date','Value']; performs asof-join and returns merged frame."""
@@ -34,6 +29,122 @@ def _merge_asof_two(left: pd.DataFrame, right: pd.DataFrame):
     m = pd.merge_asof(l, r, on="Date", direction="nearest")
     m = m.dropna()
     return m
+
+
+
+def _safe_sheet_name(name: str) -> str:
+    # Excel: max 31, keine : \ / ? * [ ]
+    name = (name or "Portfolio").strip()
+    name = re.sub(r"[:\\/?*\[\]]", "_", name)
+    return name[:31] if len(name) > 31 else name
+
+
+def export_all_portfolios_to_excel_scroll(
+    es,
+    index_name: str,
+    filepath: str = "exports/portfolios_export.xlsx",
+    scroll: str = "2m",
+    batch_size: int = 500,
+) -> str:
+    """
+    Exportiert ALLE Portfolios aus Elasticsearch (vollständig) in eine Excel:
+    - Sheet 'All' mit allem
+    - pro Portfolio ein Sheet
+
+    Erwartet Dokument-Struktur:
+      doc = { "name":..., "market_condition":..., "selected_industry":..., "items":[{"category","symbol","amount"}, ...] }
+    """
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    # 1) initial search (scroll)
+    resp = es.search(
+        index=index_name,
+        body={"query": {"match_all": {}}, "sort": ["_doc"]},
+        size=batch_size,
+        scroll=scroll,
+    )
+
+    scroll_id = resp.get("_scroll_id")
+    hits = resp.get("hits", {}).get("hits", [])
+
+    all_rows = []
+    used_sheet_names = set()
+
+    def doc_to_df(doc_id: str, src: dict) -> pd.DataFrame:
+        pname = src.get("name") or f"portfolio_{doc_id}"
+        market = src.get("market_condition", "")
+        industry = src.get("selected_industry", "")
+
+        items = src.get("items") or []
+        # falls items mal als dict kommt -> in liste umformen
+        if isinstance(items, dict):
+            # best effort: {category:{symbol:amount}} oder ähnlich
+            tmp = []
+            for cat, symvals in items.items():
+                if isinstance(symvals, dict):
+                    for sym, amt in symvals.items():
+                        tmp.append({"category": cat, "symbol": sym, "amount": amt})
+            items = tmp
+
+        df = pd.DataFrame(items)
+        if df.empty:
+            df = pd.DataFrame(columns=["category", "symbol", "amount"])
+
+        for col in ["category", "symbol", "amount"]:
+            if col not in df.columns:
+                df[col] = None
+
+        df["portfolio_id"] = doc_id
+        df["portfolio_name"] = pname
+        df["market_condition"] = market
+        df["selected_industry"] = industry
+
+        df = df[["portfolio_name", "portfolio_id", "market_condition", "selected_industry", "category", "symbol", "amount"]]
+        df = df.sort_values(by=["category", "symbol"], kind="stable")
+        return df
+
+    with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+        # 2) iterate scroll pages
+        while hits:
+            for h in hits:
+                doc_id = h.get("_id")
+                src = h.get("_source", {}) or {}
+
+                df = doc_to_df(doc_id, src)
+                all_rows.append(df)
+
+                # Sheetname: NAME + short ID => garantiert eindeutig, keine Überschreibung
+                base = f"{src.get('name','Portfolio')}_{doc_id[:6]}"
+                sheet = _safe_sheet_name(base)
+                if sheet in used_sheet_names:
+                    # notfalls eindeutiger machen
+                    sheet = _safe_sheet_name(f"{src.get('name','Portfolio')}_{doc_id[:10]}")
+                used_sheet_names.add(sheet)
+
+                df.to_excel(writer, sheet_name=sheet, index=False)
+
+            # next scroll
+            resp = es.scroll(scroll_id=scroll_id, scroll=scroll)
+            scroll_id = resp.get("_scroll_id")
+            hits = resp.get("hits", {}).get("hits", [])
+
+        # 3) "All" sheet
+        if all_rows:
+            df_all = pd.concat(all_rows, ignore_index=True)
+            df_all = df_all.sort_values(by=["portfolio_name", "category", "symbol"], kind="stable")
+        else:
+            df_all = pd.DataFrame(columns=["portfolio_name","portfolio_id","market_condition","selected_industry","category","symbol","amount"])
+
+        df_all.to_excel(writer, sheet_name="All", index=False)
+
+    # scroll cleanup (optional)
+    try:
+        if scroll_id:
+            es.clear_scroll(scroll_id=scroll_id)
+    except Exception:
+        pass
+
+    return filepath
 
 def get_es_connection():
     """Creates a connection to Elasticsearch."""
@@ -884,3 +995,110 @@ def make_criteria_with_labels(CATEGORIES):
             augmented.append((used_field, label_text, rule, optional))
         labeled[cat] = augmented
     return labeled
+# ==========================================================
+# 7️⃣ Top10 Snapshot Storage (persistente Speicherung)
+# ==========================================================
+
+TOP10_SNAPSHOT_INDEX = os.getenv("TOP10_SNAPSHOT_INDEX", "top10_snapshots")
+
+
+def ensure_top10_snapshot_index(es):
+    """Creates the index for persistent Top10 snapshots if missing."""
+    if es.indices.exists(index=TOP10_SNAPSHOT_INDEX):
+        return
+
+    es.indices.create(
+        index=TOP10_SNAPSHOT_INDEX,
+        body={
+            "mappings": {
+                "properties": {
+                    "name": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                    "updated_at": {"type": "date"},
+                    "meta": {"type": "object", "enabled": True},
+                    "filters": {"type": "object", "enabled": True},
+                    "top10_by_category": {"type": "object", "enabled": True},
+                }
+            }
+        },
+    )
+
+
+def save_top10_snapshot(es, name: str, payload: dict, snapshot_id: str | None = None) -> str:
+    """
+    Speichert einen Top10 Snapshot dauerhaft in ES.
+    - name: sprechender Name
+    - payload: {meta, top10_by_category, (optional) filters}
+    - snapshot_id: optional (wenn du überschreiben willst), sonst wird neue ID erzeugt
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    doc = {
+        "name": name.strip(),
+        "created_at": now,
+        "updated_at": now,
+        "meta": payload.get("meta", {}),
+        "filters": payload.get("filters", {}),
+        "top10_by_category": payload.get("top10_by_category", {}),
+    }
+
+    if snapshot_id:
+        # upsert
+        es.update(
+            index=TOP10_SNAPSHOT_INDEX,
+            id=snapshot_id,
+            body={"doc": doc, "doc_as_upsert": True},
+            refresh=True,
+        )
+        return snapshot_id
+
+    res = es.index(index=TOP10_SNAPSHOT_INDEX, document=doc, refresh=True)
+    return res["_id"]
+
+
+def list_top10_snapshots(es, limit: int = 200):
+    """Listet Snapshots (neueste zuerst)."""
+    resp = es.search(
+        index=TOP10_SNAPSHOT_INDEX,
+        body={
+            "size": limit,
+            "sort": [{"updated_at": {"order": "desc"}}],
+            "_source": ["name", "updated_at", "meta", "filters"],
+            "query": {"match_all": {}},
+        },
+    )
+    hits = resp.get("hits", {}).get("hits", [])
+    out = []
+    for h in hits:
+        src = h.get("_source", {}) or {}
+        out.append({
+            "id": h.get("_id"),
+            "name": src.get("name", ""),
+            "updated_at": src.get("updated_at"),
+            "meta": src.get("meta", {}),
+            "filters": src.get("filters", {}),
+        })
+    return out
+
+
+def load_top10_snapshot(es, snapshot_id: str) -> Optional[dict]:
+    """Lädt Snapshot by ID und gibt payload im gleichen Format zurück wie deine Session erwartet."""
+    try:
+        src = es.get(index=TOP10_SNAPSHOT_INDEX, id=snapshot_id)["_source"]
+    except NotFoundError:
+        return None
+
+    return {
+        "meta": src.get("meta", {}),
+        "filters": src.get("filters", {}),
+        "top10_by_category": src.get("top10_by_category", {}),
+    }
+
+
+def delete_top10_snapshot(es, snapshot_id: str) -> bool:
+    try:
+        es.delete(index=TOP10_SNAPSHOT_INDEX, id=snapshot_id, refresh=True)
+        return True
+    except NotFoundError:
+        return False
+

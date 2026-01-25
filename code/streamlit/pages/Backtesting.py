@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 import importlib
-import numpy as np
 
 # ==========================================================
 # Pfad zur src-Ebene
@@ -22,6 +21,11 @@ from src.funktionen import (
     get_es_connection,
     score_row,
     enrich_document_fields,
+    ensure_top10_snapshot_index,
+    save_top10_snapshot,
+    list_top10_snapshots,
+    load_top10_snapshot,
+    delete_top10_snapshot,
 )
 
 # ==========================================================
@@ -38,8 +42,11 @@ st.markdown("*(Daten aus Elasticsearch – bewertet nach Lynch-Kriterien)*")
 es = get_es_connection()
 ES_INDEX = os.getenv("ELASTICSEARCH_INDEX", "stocks")
 
+# ✅ Persistente Snapshot-DB sicherstellen
+ensure_top10_snapshot_index(es)
+
 # ==========================================================
-# ✅ UI-State Cache (ES) mit TTL 60 min
+# ✅ UI-State Cache (ES) mit TTL (nur Komfort, nicht persistent)
 # ==========================================================
 STATE_INDEX = os.getenv("UI_STATE_INDEX", "ui_state_top10")
 TTL_MINUTES = int(os.getenv("UI_STATE_TTL_MINUTES", "60"))
@@ -60,7 +67,6 @@ def ensure_state_index(es_client):
         }
         es_client.indices.create(index=STATE_INDEX, body=mapping)
     except Exception:
-        # wenn es z.B. schon existiert oder Rechte fehlen -> nicht hart abbrechen
         pass
 
 def _now_utc():
@@ -70,7 +76,6 @@ def _parse_iso(dt_str: str):
     if not dt_str:
         return None
     try:
-        # isoformat kann "Z" enthalten – sauber behandeln
         return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     except Exception:
         return None
@@ -106,6 +111,62 @@ if "client_id" not in st.session_state:
     st.session_state["client_id"] = str(uuid.uuid4())
 
 # ==========================================================
+# Sidebar: Persistente Snapshots (dauerhaft speichern/laden)
+# ==========================================================
+st.sidebar.markdown("---")
+st.sidebar.subheader("📂 Gespeicherte Top10-Snapshots (dauerhaft)")
+
+snapshots = list_top10_snapshots(es)
+snap_labels = ["—"] + [
+    f'{s["name"]} | {s.get("meta", {}).get("source","?")} {s.get("meta", {}).get("quarter","?")} | '
+    f'{s.get("meta", {}).get("start","?")}..{s.get("meta", {}).get("end","?")}'
+    for s in snapshots
+]
+sel_snap = st.sidebar.selectbox("Snapshot auswählen:", snap_labels, index=0)
+
+col_sb1, col_sb2 = st.sidebar.columns(2)
+load_snap_clicked = col_sb1.button("📥 Laden")
+delete_snap_clicked = col_sb2.button("🗑️ Löschen")
+
+if load_snap_clicked and sel_snap != "—":
+    idx = snap_labels.index(sel_snap) - 1
+    snap_id = snapshots[idx]["id"]
+    payload = load_top10_snapshot(es, snap_id)
+
+    if payload:
+        # Session-State setzen, Portfolio-Page kann es direkt nutzen
+        st.session_state["top10_dynamisch_export"] = {
+            "meta": payload.get("meta", {}),
+            "top10_by_category": payload.get("top10_by_category", {}),
+        }
+
+        # Optional: Filter in UI übernehmen (wenn du willst)
+        filt = payload.get("filters", {})
+        if filt:
+            st.session_state["source_choice"] = filt.get("source_choice", st.session_state.get("source_choice", "Only FMP"))
+            st.session_state["quarter"] = filt.get("quarter", st.session_state.get("quarter", "Q1"))
+            try:
+                st.session_state["start_date"] = pd.to_datetime(filt.get("start_date")).date()
+                st.session_state["end_date"] = pd.to_datetime(filt.get("end_date")).date()
+            except Exception:
+                pass
+
+        st.sidebar.success("✅ Snapshot geladen. Öffne jetzt die Portfolio-Page.")
+        st.rerun()
+    else:
+        st.sidebar.error("Snapshot nicht gefunden.")
+
+if delete_snap_clicked and sel_snap != "—":
+    idx = snap_labels.index(sel_snap) - 1
+    snap_id = snapshots[idx]["id"]
+    ok = delete_top10_snapshot(es, snap_id)
+    if ok:
+        st.sidebar.success("✅ Snapshot gelöscht.")
+        st.rerun()
+    else:
+        st.sidebar.error("Löschen fehlgeschlagen.")
+
+# ==========================================================
 # Sidebar Defaults aus Cache laden (einmalig pro Session)
 # ==========================================================
 DEFAULT_START = datetime(2009, 12, 1).date()
@@ -119,45 +180,35 @@ CACHE_BOOT_KEY = "top10_cache_bootstrapped"
 if not st.session_state.get(CACHE_BOOT_KEY, False):
     cached = load_cached_state(es, st.session_state["client_id"])
     if isinstance(cached, dict):
-        # Filter
         filt = cached.get("filters", {})
         st.session_state.setdefault("source_choice", filt.get("source_choice", "Only FMP"))
         st.session_state.setdefault("quarter", filt.get("quarter", "Q1"))
 
-        # dates: als iso gespeichert
         sd = filt.get("start_date")
         ed = filt.get("end_date")
         try:
-            st.session_state.setdefault(
-                "start_date",
-                pd.to_datetime(sd).date() if sd else DEFAULT_START
-            )
+            st.session_state.setdefault("start_date", pd.to_datetime(sd).date() if sd else DEFAULT_START)
         except Exception:
             st.session_state.setdefault("start_date", DEFAULT_START)
 
         try:
-            st.session_state.setdefault(
-                "end_date",
-                pd.to_datetime(ed).date() if ed else DEFAULT_END
-            )
+            st.session_state.setdefault("end_date", pd.to_datetime(ed).date() if ed else DEFAULT_END)
         except Exception:
             st.session_state.setdefault("end_date", DEFAULT_END)
 
-        # Kategorie
         st.session_state.setdefault("kategorie", cached.get("kategorie"))
 
-        # Top10 export (optional)
         if cached.get("top10_dynamisch_export"):
             st.session_state["top10_dynamisch_export"] = cached["top10_dynamisch_export"]
             st.sidebar.info("♻️ Top10-Export aus Cache geladen (TTL).")
+
     st.session_state[CACHE_BOOT_KEY] = True
 
 # ==========================================================
-# Sidebar Controls (mit Keys, damit nichts „weg“ ist)
+# Sidebar Controls (mit Keys)
 # ==========================================================
 st.sidebar.header("⚙️ Einstellungen")
 
-# robust index bestimmen
 def _idx(options, val, fallback=0):
     try:
         return options.index(val)
@@ -195,7 +246,6 @@ end_date = st.sidebar.date_input(
     max_value=MAX_DATE,
     key="end_date",
 )
-
 
 if start_date > end_date:
     st.sidebar.error("Startdatum darf nicht nach Enddatum liegen.")
@@ -260,7 +310,6 @@ df = pd.DataFrame(hits)
 
 if df.empty:
     st.warning("⚠️ Keine Daten nach Filter (Quelle/Zeitraum/Quartal).")
-    # trotzdem Filter in Cache speichern, damit Sidebar beim nächsten Öffnen bleibt
     save_cached_state(es, st.session_state["client_id"], {
         "filters": {
             "source_choice": SOURCE_MODE,
@@ -494,7 +543,6 @@ def make_criteria_with_labels():
 
 CRITERIA = make_criteria_with_labels()
 
-# Kategorie-Widget (persistiert)
 kategorie_default = st.session_state.get("kategorie")
 if kategorie_default not in list(CRITERIA.keys()):
     kategorie_default = list(CRITERIA.keys())[0]
@@ -704,21 +752,30 @@ top10_payload = {
     "top10_by_category": top10_export,
 }
 
-st.session_state["top10_dynamisch_export"] = top10_payload
 
 # ==========================================================
-# ✅ Cache in ES aktualisieren (Filters + Kategorie + Export)
+# ✅ Persistentes Speichern (Snapshot) – Button im Main-UI
 # ==========================================================
-cache_payload = {
-    "filters": {
+st.markdown("---")
+st.subheader("💾 Top10 Snapshot dauerhaft speichern")
+
+default_snap_name = f"{SOURCE_MODE} | {FIXED_QUARTER} | {START_DATE_STR}..{END_DATE_STR}"
+snap_name = st.text_input("Snapshot-Name", value=default_snap_name)
+
+col_save1, col_save2 = st.columns([1, 2])
+with col_save1:
+    save_snapshot_clicked = st.button("✅ Snapshot speichern")
+with col_save2:
+    st.caption("Dieser Snapshot bleibt dauerhaft in Elasticsearch und kann später geladen werden.")
+
+if save_snapshot_clicked:
+    persist_payload = dict(top10_payload)
+    persist_payload["filters"] = {
         "source_choice": SOURCE_MODE,
         "quarter": FIXED_QUARTER,
         "start_date": START_DATE_STR,
         "end_date": END_DATE_STR,
-    },
-    "kategorie": kategorie,
-    "top10_dynamisch_export": top10_payload,
-}
-save_cached_state(es, st.session_state["client_id"], cache_payload)
+    }
+    snap_id = save_top10_snapshot(es, name=snap_name, payload=persist_payload)
+    st.success(f"✅ Snapshot gespeichert (ID: {snap_id}).")
 
-st.sidebar.success(f"✅ Top10-Export gesetzt & gecached (TTL {TTL_MINUTES} min). Öffne jetzt die Portfolio-Page.") 
