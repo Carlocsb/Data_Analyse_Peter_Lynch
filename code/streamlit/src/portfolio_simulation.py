@@ -20,6 +20,24 @@ def parse_portfolio_name(name: str) -> Optional[tuple[int, int]]:
         return None
     return int(m.group("y")), int(m.group("q"))
 
+def _year_filter(year: int) -> dict:
+    """
+    ES term queries sind typenstreng.
+    In deinem Index ist calendarYear offenbar als STRING gespeichert (z.B. "2021").
+    Deshalb matchen wir sowohl int als auch str (+ keyword fallback).
+    """
+    y_str = str(year)
+    return {
+        "bool": {
+            "should": [
+                {"term": {"calendarYear": year}},          # falls int gemappt
+                {"term": {"calendarYear": y_str}},         # falls string gemappt
+                {"term": {"calendarYear.keyword": y_str}}, # falls keyword-subfield existiert
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
 
 # =========================
 # Portfolio weights
@@ -47,9 +65,6 @@ def portfolio_doc_to_amount_weights(portfolio_doc: Dict[str, Any]) -> Dict[str, 
     return {sym: float(amt) / total for sym, amt in amounts.items()}
 
 
-# =========================
-# Buy date = like dynamic (ld from stocks)
-# =========================
 def ld_from_stocks(
     es_client,
     stocks_index: str,
@@ -59,56 +74,58 @@ def ld_from_stocks(
 ) -> Optional[pd.Timestamp]:
     """
     Pro Symbol max(date) in stocks (calendarYear, period), dann global max.
-    Das ist exakt die Logik aus deinem Dynamik-Code.
+    Für deinen Index:
+      - symbol ist keyword -> Feld "symbol"
+      - calendarYear ist text+keyword -> "calendarYear.keyword"
+      - period ist text+keyword -> "period.keyword"
     """
     if not symbols:
         return None
+
     period = f"Q{quarter}"
 
-    for sym_field in ["symbol.keyword", "symbol"]:
-        for per_field in ["period.keyword", "period"]:
-            body = {
-                "size": 0,
-                "query": {
-                    "bool": {
-                        "filter": [
-                            {"terms": {sym_field: symbols}},
-                            {"term": {"calendarYear": year}},
-                            {"term": {per_field: period}},
-                        ]
-                    }
-                },
-                "aggs": {
-                    "by_symbol": {
-                        "terms": {"field": sym_field, "size": len(symbols)},
-                        "aggs": {"max_date": {"max": {"field": "date"}}},
-                    }
-                },
+    body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"symbol": symbols}},
+                    {"term": {"calendarYear.keyword": str(year)}},
+                    {"term": {"period.keyword": period}},
+                ]
             }
-            try:
-                resp = es_client.search(index=stocks_index, body=body)
-            except Exception:
-                continue
+        },
+        "aggs": {
+            "by_symbol": {
+                "terms": {"field": "symbol", "size": len(symbols)},
+                "aggs": {"max_date": {"max": {"field": "date"}}},
+            }
+        },
+    }
 
-            buckets = resp.get("aggregations", {}).get("by_symbol", {}).get("buckets", [])
-            ds: List[pd.Timestamp] = []
-            for b in buckets:
-                agg = b.get("max_date", {})
-                s = agg.get("value_as_string")
-                v = agg.get("value")
-                if s:
-                    d = pd.to_datetime(s, utc=True, errors="coerce")
-                elif v is not None:
-                    d = pd.to_datetime(v, unit="ms", utc=True, errors="coerce")
-                else:
-                    d = pd.NaT
-                if pd.notna(d):
-                    ds.append(d)
+    resp = es_client.search(index=stocks_index, body=body)
+    buckets = resp.get("aggregations", {}).get("by_symbol", {}).get("buckets", [])
 
-            if ds:
-                return max(ds)
+    ds: List[pd.Timestamp] = []
+    for b in buckets:
+        agg = b.get("max_date", {})
+        s = agg.get("value_as_string")
+        v = agg.get("value")
 
-    return None
+        if s:
+            d = pd.to_datetime(s, utc=True, errors="coerce")
+        elif v is not None:
+            d = pd.to_datetime(v, unit="ms", utc=True, errors="coerce")
+        else:
+            d = pd.NaT
+
+        if pd.notna(d):
+            ds.append(d)
+
+    return max(ds) if ds else None
+
+
+
 
 
 def get_buy_date_like_dynamic_for_portfolio(
@@ -310,7 +327,7 @@ def price_on_or_before(
         return None
     ld_str = ld.strftime("%Y-%m-%d")
 
-    for sym_field in ["symbol.keyword", "symbol"]:
+    for sym_field in ["symbol"]:
         body = {
             "size": 1,
             "_source": ["symbol", "date", "adjClose"],
@@ -340,6 +357,74 @@ def price_on_or_before(
             return None
 
     return None
+def quarter_end_date(year: int, quarter: int) -> pd.Timestamp:
+    if quarter == 1:
+        return pd.Timestamp(year=year, month=3, day=31)
+    if quarter == 2:
+        return pd.Timestamp(year=year, month=6, day=30)
+    if quarter == 3:
+        return pd.Timestamp(year=year, month=9, day=30)
+    return pd.Timestamp(year=year, month=12, day=31)
+
+def audit_ld_from_stocks(
+    es_client,
+    stocks_index: str,
+    symbols: List[str],
+    year: int,
+    quarter: int,
+) -> Tuple[pd.DataFrame, Optional[pd.Timestamp]]:
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "max_date", "max_date_raw"]), None
+
+    period = f"Q{quarter}"
+
+    body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": [
+                    {"terms": {"symbol": symbols}},
+                    {"term": {"calendarYear.keyword": str(year)}},
+                    {"term": {"period.keyword": period}},
+                ]
+            }
+        },
+        "aggs": {
+            "by_symbol": {
+                "terms": {"field": "symbol", "size": len(symbols)},
+                "aggs": {"max_date": {"max": {"field": "date"}}},
+            }
+        },
+    }
+
+    resp = es_client.search(index=stocks_index, body=body)
+    buckets = resp.get("aggregations", {}).get("by_symbol", {}).get("buckets", [])
+
+    rows = []
+    for b in buckets:
+        sym = b.get("key")
+        agg = b.get("max_date", {})
+        s = agg.get("value_as_string")
+        v = agg.get("value")
+
+        if s:
+            d = pd.to_datetime(s, utc=True, errors="coerce")
+        elif v is not None:
+            d = pd.to_datetime(v, unit="ms", utc=True, errors="coerce")
+        else:
+            d = pd.NaT
+
+        rows.append({"symbol": sym, "max_date": d, "max_date_raw": s or v})
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, None
+
+    df = df.sort_values("max_date", ascending=False).reset_index(drop=True)
+    ld_global = df["max_date"].dropna().max() if df["max_date"].notna().any() else None
+    return df, ld_global
+
+
 
 
 @st.cache_data(show_spinner=True, ttl=300)
@@ -446,6 +531,9 @@ def simulate_dynamic_cached(
             continue
 
         ld = ld_from_stocks(_es_client, stocks_index, new_syms, year, quarter)
+        # --- AUDIT ld: welches Symbol liefert das max(date)? ---
+
+
         if ld is None or pd.isna(ld):
             continue
 
@@ -526,4 +614,253 @@ def simulate_dynamic_cached(
     df["buy_date"] = pd.to_datetime(df["buy_date"], errors="coerce")
 
     df = df.dropna(subset=["ld", "end_value"]).sort_values("ld")
+
     return df
+# =========================
+# Quarter helpers (EOQ / index)
+# =========================
+_QRE = re.compile(r"^(?P<y>\d{4})-Q(?P<q>[1-4])$")
+
+def quarter_to_index(qname: str) -> Optional[int]:
+    m = _QRE.match(str(qname).strip())
+    if not m:
+        return None
+    return int(m.group("y")) * 4 + (int(m.group("q")) - 1)
+
+def index_to_quarter(qi: int) -> str:
+    y = qi // 4
+    q = (qi % 4) + 1
+    return f"{y}-Q{q}"
+
+def nav_to_eoq(df_nav: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_nav: columns ['date','nav'] (daily)
+    returns: quarter, ld (EOQ date), end_value (EOQ nav)
+    """
+    if df_nav is None or df_nav.empty:
+        return pd.DataFrame()
+
+    x = df_nav.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x["nav"] = pd.to_numeric(x["nav"], errors="coerce")
+    x = x.dropna(subset=["date", "nav"]).sort_values("date")
+
+    x["year"] = x["date"].dt.year
+    x["q"] = x["date"].dt.quarter
+    x["quarter"] = x["year"].astype(str) + "-Q" + x["q"].astype(str)
+
+    # EOQ = last row per (year,q)
+    eoq = x.groupby(["year", "q"], as_index=False).tail(1)[["quarter", "date", "nav"]]
+    eoq = eoq.rename(columns={"date": "ld", "nav": "end_value"}).sort_values("ld").reset_index(drop=True)
+
+    # add q_index (optional but super useful)
+    eoq["q_index"] = eoq["quarter"].map(quarter_to_index)
+    return eoq
+
+# =========================
+# Quarter helpers (EOQ / index / ranges)
+# =========================
+
+# WICHTIG: _QRE oben bereits definiert -> NICHT nochmal definieren!
+# Wir nutzen parse_portfolio_name(...) für YYYY-Qx und bauen darauf auf.
+
+def quarter_to_index(qname: str) -> Optional[int]:
+    pq = parse_portfolio_name(qname)
+    if pq is None:
+        return None
+    y, q = pq
+    return y * 4 + (q - 1)
+
+
+def index_to_quarter(qi: int) -> str:
+    y = qi // 4
+    q = (qi % 4) + 1
+    return f"{y}-Q{q}"
+
+
+def quarter_end_ts(qname: str) -> Optional[pd.Timestamp]:
+    """
+    Quarter-End (kal.) als Timestamp (naiv, local).
+    """
+    pq = parse_portfolio_name(qname)
+    if pq is None:
+        return None
+    y, q = pq
+    if q == 1:
+        return pd.Timestamp(year=y, month=3, day=31)
+    if q == 2:
+        return pd.Timestamp(year=y, month=6, day=30)
+    if q == 3:
+        return pd.Timestamp(year=y, month=9, day=30)
+    return pd.Timestamp(year=y, month=12, day=31)
+
+
+def list_quarters_between(q_start: str, q_end: str) -> List[str]:
+    """
+    Inklusive Start/Ende.
+    """
+    i0 = quarter_to_index(q_start)
+    i1 = quarter_to_index(q_end)
+    if i0 is None or i1 is None or i1 < i0:
+        return []
+    return [index_to_quarter(i) for i in range(i0, i1 + 1)]
+
+
+def nav_to_eoq(df_nav: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_nav: columns ['date','nav'] (daily)
+    returns: quarter, ld (EOQ date), end_value (EOQ nav), q_index
+    """
+    if df_nav is None or df_nav.empty:
+        return pd.DataFrame()
+
+    x = df_nav.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x["nav"] = pd.to_numeric(x["nav"], errors="coerce")
+    x = x.dropna(subset=["date", "nav"]).sort_values("date")
+
+    x["year"] = x["date"].dt.year
+    x["q"] = x["date"].dt.quarter
+    x["quarter"] = x["year"].astype(str) + "-Q" + x["q"].astype(str)
+
+    eoq = x.groupby(["year", "q"], as_index=False).tail(1)[["quarter", "date", "nav"]]
+    eoq = eoq.rename(columns={"date": "ld", "nav": "end_value"}).sort_values("ld").reset_index(drop=True)
+    eoq["q_index"] = eoq["quarter"].map(quarter_to_index)
+    return eoq
+
+
+def geom_avg_quarter_return(v0: float, v1: float, n_quarters: int) -> float:
+    """(v1/v0)^(1/n) - 1"""
+    if v0 <= 0 or v1 <= 0 or n_quarters <= 0:
+        return float("nan")
+    return (v1 / v0) ** (1.0 / float(n_quarters)) - 1.0
+
+
+def build_saved_portfolios_triangle(
+    es_client,
+    list_portfolios_fn,
+    load_portfolio_fn,
+    prices_matrix_loader_fn,
+    stocks_index: str,
+    end_date_cutoff: pd.Timestamp,
+    q_start: str,
+    q_end: str,
+    base_capital: float = 1000.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Dreieck über *alle* Saved Portfolios:
+
+    - jede Zeile = Portfolio (Name = Kaufquartal YYYY-Qx)
+    - jede Spalte = Verkaufsquartal
+    - Zelle = Ø Quartalsrendite (geom.) aus NAV(buy) -> NAV(sell)
+    - Zellen links/unten bleiben leer => Dreiecksform
+
+    Returns:
+      tri_df: columns [buy_q, sell_q, n_q, value]
+      status_df: pro Portfolio {name,id,status}
+    """
+    sell_quarters = list_quarters_between(q_start, q_end)
+    if not sell_quarters:
+        return pd.DataFrame(), pd.DataFrame([{"name": "", "id": "", "status": "bad_quarter_range"}])
+
+    end_dt = quarter_end_ts(q_end)
+    if end_dt is None:
+        return pd.DataFrame(), pd.DataFrame([{"name": "", "id": "", "status": "bad_q_end"}])
+
+    end_dt = min(pd.Timestamp(end_dt), pd.Timestamp(end_date_cutoff))
+
+    ports = list_portfolios_fn(es_client) or []
+    ports_q = []
+    for p in ports:
+        pid = p.get("id")
+        name = p.get("name", "")
+        if pid and parse_portfolio_name(name) is not None:
+            ports_q.append({"id": pid, "name": name})
+
+    status_rows: List[Dict[str, Any]] = []
+    nav_cache: Dict[str, pd.DataFrame] = {}
+
+    # --- compute NAV for each portfolio once ---
+    for p in ports_q:
+        pid = p["id"]
+        doc = load_portfolio_fn(es_client, pid)
+        if not doc:
+            status_rows.append({"name": p["name"], "id": pid, "status": "missing_doc"})
+            continue
+
+        weights = portfolio_doc_to_amount_weights(doc)
+        if not weights:
+            status_rows.append({"name": p["name"], "id": pid, "status": "no_weights"})
+            continue
+
+        buy_dt = get_buy_date_like_dynamic_for_portfolio(es_client, stocks_index, doc)
+        if buy_dt is None:
+            status_rows.append({"name": p["name"], "id": pid, "status": "no_buy_dt"})
+            continue
+
+        syms = sorted(weights.keys())
+        prices_mat = prices_matrix_loader_fn(syms)
+        if prices_mat is None or prices_mat.empty:
+            status_rows.append({"name": p["name"], "id": pid, "status": "no_prices"})
+            continue
+
+        df_nav, _df_trades = build_saved_buyhold_series_with_liquidation(
+            prices=prices_mat,
+            weights=weights,
+            buy_date=buy_dt,
+            initial_capital=float(base_capital),
+            end_date=end_dt,
+        )
+        if df_nav is None or df_nav.empty:
+            status_rows.append({"name": p["name"], "id": pid, "status": "nav_empty"})
+            continue
+
+        df_nav = df_nav.copy()
+        df_nav["date"] = pd.to_datetime(df_nav["date"], errors="coerce")
+        df_nav["nav"] = pd.to_numeric(df_nav["nav"], errors="coerce")
+        df_nav = df_nav.dropna(subset=["date", "nav"]).sort_values("date").reset_index(drop=True)
+
+        status_rows.append({"name": p["name"], "id": pid, "status": "ok"})
+        nav_cache[pid] = df_nav
+
+    # --- build triangle cells ---
+    rows: List[Dict[str, Any]] = []
+    for p in ports_q:
+        pid = p["id"]
+        buy_q = p["name"]
+        df_nav = nav_cache.get(pid)
+        if df_nav is None or df_nav.empty:
+            continue
+
+        buy_idx = quarter_to_index(buy_q)
+        if buy_idx is None:
+            continue
+
+        # Startwert = NAV am ersten NAV-Tag
+        v0 = float(df_nav["nav"].iloc[0])
+
+        for sell_q in sell_quarters:
+            sell_idx = quarter_to_index(sell_q)
+            if sell_idx is None or sell_idx <= buy_idx:
+                continue
+
+            n_q = int(sell_idx - buy_idx)
+            sell_end = quarter_end_ts(sell_q)
+            if sell_end is None:
+                continue
+
+            # NAV value at or before sell quarter end
+            x = df_nav[df_nav["date"] <= pd.Timestamp(sell_end)]
+            if x.empty:
+                continue
+            v1 = float(x["nav"].iloc[-1])
+
+            val = geom_avg_quarter_return(v0, v1, n_q)
+            if pd.isna(val):
+                continue
+
+            rows.append({"buy_q": buy_q, "sell_q": sell_q, "n_q": n_q, "value": float(val)})
+
+    tri_df = pd.DataFrame(rows)
+    status_df = pd.DataFrame(status_rows)
+    return tri_df, status_df

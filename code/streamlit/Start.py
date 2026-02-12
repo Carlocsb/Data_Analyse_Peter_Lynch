@@ -1,14 +1,9 @@
 
 import streamlit as st
-import os, sys, math
+
 from datetime import datetime
-import pandas as pd
+
 import streamlit as st
-import importlib
-from pathlib import Path
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 st.set_page_config(page_title="Aktienanalyse nach Peter Lynch", layout="wide")
 
