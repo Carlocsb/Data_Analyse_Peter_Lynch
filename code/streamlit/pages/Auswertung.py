@@ -53,6 +53,7 @@ GSPC_SYMBOL = os.getenv("GSPC_SYMBOL", "^GSPC")
 SPXEW_SYMBOL = os.getenv("SPXEW_SYMBOL", "^SPXEW")
 
 END_DATE_DEFAULT = pd.Timestamp("2025-12-31")
+MIN_NQ = 4
 
 es = get_es_connection()
 
@@ -340,18 +341,52 @@ def plot_boxplots_saved_vs_dyn(
     n_max: int,
     height: int = 320,
 ) -> alt.Chart:
+
     x = d_both[(d_both["n_q"] >= int(n_min)) & (d_both["n_q"] <= int(n_max))].copy()
     if x.empty:
         return alt.Chart(pd.DataFrame({"_": ["Keine Daten in diesem Bereich."]})).mark_text().encode(text="_")
 
     label_angle = 0 if (n_max - n_min) <= 12 else 90
 
+    # --- Y-Achse: feste Domain + custom ticks (robust über n_min/n_max) ---
+    is_brutto = "brutto" in (title or "").lower()
+
+    # default domains
+    if is_brutto:
+        y_domain = [-0.05, 0.30]
+        y_ticks = [-0.05, -0.02, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12]
+        # für 4–12 mehr nach oben
+        if n_min <= 4 and n_max <= 12:
+            y_ticks += [0.15, 0.20, 0.25, 0.30]
+        # für 31–60 fein im unteren Bereich (optional)
+        if n_min >= 31:
+            y_ticks += [0.02, 0.04, 0.06, 0.08]
+    else:
+        # Netto
+        y_domain = [-0.05, 0.25 ]
+        y_ticks = [-0.10, -0.05, -0.02, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10]
+        # für 4–12 mehr nach oben
+        if n_min <= 4 and n_max <= 12:
+            y_ticks += [0.15, 0.20, 0.25]
+        # für 31–60 fein (optional)
+        if n_min >= 31:
+            y_ticks += [0.02, 0.04, 0.06]
+
+    # wichtig: sort + dedupe + innerhalb Domain
+    y_ticks = sorted({t for t in y_ticks if y_domain[0] <= t <= y_domain[1]})
+
+    # --- Chart ---
     return (
         alt.Chart(x)
         .mark_boxplot(extent="min-max")
         .encode(
             x=alt.X("n_q:O", title="Haltedauer (Quartale)", axis=alt.Axis(labelAngle=label_angle)),
-            y=alt.Y("value:Q", title="Ø Quartalsrendite (geom.)", axis=alt.Axis(format=".1%")),
+            y=alt.Y(
+                "value:Q",
+                title="Ø Quartalsrendite (geom.)",
+                scale=alt.Scale(domain=y_domain),
+                axis=alt.Axis(format=".1%", values=y_ticks),
+            ),
             xOffset=alt.XOffset("mode:N"),
             color=alt.Color("mode:N", title="Modus"),
             tooltip=[
@@ -364,6 +399,9 @@ def plot_boxplots_saved_vs_dyn(
         )
         .properties(title=title, height=height)
     )
+
+
+
 
 
 # ============================================================
@@ -614,7 +652,7 @@ def extract_diagonals(tri: pd.DataFrame, max_n: int) -> pd.DataFrame:
     d = d.dropna(subset=["n_q", "value"]).copy()
     d["n_q"] = d["n_q"].astype(int)
 
-    d = d[(d["n_q"] >= 1) & (d["n_q"] <= int(max_n))].copy()
+    d = d[(d["n_q"] >= int(MIN_NQ)) & (d["n_q"] <= int(max_n))].copy()
     return d[["n_q", "buy_q", "sell_q", "value"]].sort_values(["n_q", "buy_q", "sell_q"]).reset_index(drop=True)
 
 
@@ -721,23 +759,42 @@ with st.sidebar:
 
     st.divider()
     st.header("Linienchart (Settings)")
-    line_max_n = st.number_input("Linienchart bis Haltedauer (n_q)", min_value=2, max_value=120, value=60, step=1, key="line_max_n")
-    line_split_mode = st.selectbox("Linienchart Splits", ["gesplittet (1–12, 13–30, 31–max)", "ein Chart"], index=0)
+    line_max_n = st.number_input(
+        "Linienchart bis Haltedauer (n_q)",
+        min_value=MIN_NQ,
+        max_value=120,
+        value=max(60, MIN_NQ),
+        step=1,
+        key="line_max_n",
+    )
+
+    line_split_mode = st.selectbox(
+        "Linienchart Splits",
+        [f"gesplittet ({MIN_NQ}–12, 13–30, 31–max)", "ein Chart"],
+        index=0,
+    )
 
     st.divider()
     st.header("Vergleich (Saved vs Dynamik)")
     show_compare_net = st.checkbox("Vergleich Netto (Saved vs Dynamik)", True)
     show_compare_gross = st.checkbox("Vergleich Brutto (Saved vs Dynamik)", True)
-    compare_max = st.number_input("Vergleich bis Haltedauer (n_q)", min_value=2, max_value=60, value=60, step=1, key="cmp_max")
+    compare_max = st.number_input(
+        "Vergleich bis Haltedauer (n_q)",
+        min_value=MIN_NQ,
+        max_value=60,
+        value=max(60, MIN_NQ),
+        step=1,
+        key="cmp_max",
+    )
 
-
-# Split ohne Overlap (für Einzel-Blocks)
-split_a_min, split_a_max = 1, 12
+# ============================================================
+# Global ranges / splits (AFTER sidebar!)  <-- FIX für cmp_max
+# ============================================================
+split_a_min, split_a_max = MIN_NQ, 12
 split_b_min, split_b_max = 13, min(int(max_n), 60)
-cmp_max = int(min(compare_max, int(max_n), 60))
 
-# Vergleichsplits (untereinander): 1–12, 13–30, 31–60
-cmp_splits = [(1, 12), (13, 30), (31, 60)]
+cmp_max = int(min(int(compare_max), int(max_n), 60))
+cmp_splits = [(MIN_NQ, 12), (13, 30), (31, 60)]
 
 
 # ============================================================
@@ -752,7 +809,7 @@ def render_block(
 ) -> None:
     st.subheader(f"Boxplots ({title_prefix}) – gesplittet (untereinander)")
 
-    # 1–12
+    # MIN_NQ–12
     st.altair_chart(
         plot_boxplots_by_nq_range(d, f"{title_prefix} – Haltedauer {split_a_min}–{split_a_max}", split_a_min, split_a_max),
         use_container_width=True,
@@ -762,7 +819,6 @@ def render_block(
             plot_counts_by_nq_range(d, f"{title_prefix} – Anzahl Werte {split_a_min}–{split_a_max}", split_a_min, split_a_max),
             use_container_width=True,
         )
-
     if show_median_lines:
         med = median_by_nq(d, title_prefix)
         st.altair_chart(
@@ -782,7 +838,6 @@ def render_block(
             plot_counts_by_nq_range(d, f"{title_prefix} – Anzahl Werte {split_b_min}–{split_b_max}", split_b_min, split_b_max),
             use_container_width=True,
         )
-
     if show_median_lines:
         med = median_by_nq(d, title_prefix)
         st.altair_chart(
@@ -794,9 +849,9 @@ def render_block(
         st.subheader(f"Detailansicht ({title_prefix}) – Werte hinter n_q (absteigend)")
         nq_dbg = st.number_input(
             f"Welche Haltedauer anzeigen? ({title_prefix})",
-            min_value=1,
+            min_value=int(MIN_NQ),
             max_value=int(max_n_local),
-            value=1,
+            value=int(MIN_NQ),
             key=f"{key_prefix}_nq",
         )
         detail = show_values_for_nq(tri, int(nq_dbg), sort_desc=True)
@@ -811,6 +866,7 @@ def render_compare_section(title: str, d_saved: pd.DataFrame, d_dyn: pd.DataFram
         return
 
     both = stack_saved_dyn(d_saved, d_dyn)
+    both = both[both["n_q"] >= int(MIN_NQ)].copy()
 
     for a, b in cmp_splits:
         if cmp_max < a:
@@ -934,8 +990,6 @@ if need_bench:
 
 # ============================================================
 # Linienchart: Median-Rendite vs Haltedauer
-#   - KEIN "Linienchart anzeigen" Toggle mehr
-#   - Serienauswahl im MAIN (Expander wie Screenshot)
 # ============================================================
 st.divider()
 st.header("Linienchart: Median-Rendite über Haltedauer")
@@ -973,10 +1027,8 @@ if med_all.empty:
 else:
     available_series = sorted(med_all["mode"].dropna().unique().tolist())
 
-    # UI im MAIN (wie dein 2. Screenshot)
     with st.expander("Linienchart – aktive Serien", expanded=False):
         default_selected = st.session_state.get("selected_line_series_main", available_series)
-        # clamp default -> available
         default_selected = [s for s in default_selected if s in available_series]
         if not default_selected:
             default_selected = available_series
@@ -995,7 +1047,7 @@ else:
     med_all = med_all[med_all["mode"].isin(selected)].copy()
 
     if line_split_mode.startswith("gesplittet"):
-        line_splits = [(1, 12), (13, 30), (31, line_max)]
+        line_splits = [(MIN_NQ, 12), (13, 30), (31, line_max)]
         for a, b in line_splits:
             if line_max < a:
                 continue
@@ -1014,8 +1066,8 @@ else:
         st.altair_chart(
             plot_median_lines_multi(
                 med_all,
-                f"Median-Linien – Haltedauer 1–{line_max}",
-                1,
+                f"Median-Linien – Haltedauer {MIN_NQ}–{line_max}",
+                MIN_NQ,
                 line_max,
                 height=380,
             ),
@@ -1109,8 +1161,8 @@ st.divider()
 st.header("Vergleich: Saved vs Dynamik (nebeneinander) – bis n_q (untereinander)")
 st.caption("Benchmarks werden hier bewusst NICHT mit aufgenommen.")
 
-if cmp_max < 2:
-    st.info("Vergleich benötigt compare_max >= 2.")
+if cmp_max < MIN_NQ:
+    st.info(f"Vergleich benötigt compare_max >= {MIN_NQ}.")
 else:
     if show_compare_net:
         render_compare_section("Vergleich – Netto (mit Steuer)", d_saved_net, d_dyn_net)

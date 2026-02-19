@@ -39,10 +39,13 @@ Thumbs.db
 docker-data/
 *.pid
 
+
 # --- Cached data ---
 *.cache
 *.sqlite
 *.db
+sp_data_2/
+
 
 # --- Python build ---
 build/
