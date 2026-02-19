@@ -44,7 +44,8 @@ docker-data/
 *.cache
 *.sqlite
 *.db
-sp_data_2/
+data/sp_data_2/
+
 
 
 # --- Python build ---
