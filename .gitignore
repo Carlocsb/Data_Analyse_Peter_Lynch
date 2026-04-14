@@ -45,6 +45,7 @@ docker-data/
 *.sqlite
 *.db
 data/sp_data_2/
+code/streamlit/pages/Dia_BS.py
 
 
 

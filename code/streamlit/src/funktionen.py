@@ -912,25 +912,26 @@ def force_fill_metrics(d: dict, es, source_mode: Optional[str] = None, flags: Op
     if flags.get("fcf_per_share_buildable") and out.get("freeCashFlowPerShare") is None:
         if out.get("freeCashFlow") is not None and out.get("sharesOutstanding"):
             out["freeCashFlowPerShare"] = _safe_div(out["freeCashFlow"], out["sharesOutstanding"])
-        # === Backfill totalDebt (e.g., if yfinance missing) ===
-    if out.get("totalDebt") is None and es is not None:
-        td = load_historical_metrics(
-            es, out.get("symbol"),
-            ["totalDebt", "shortLongTermDebtTotal", "shortLongTermDebt"],
-            source_mode
-        )
-        if not td.empty:
-            out["totalDebt"] = float(td["Value"].iloc[-1])
 
-    # === Backfill totalAssets ===
-    if out.get("totalAssets") is None and es is not None:
-        ta = load_historical_metrics(
-            es, out.get("symbol"),
-            ["totalAssets", "TotalAssets"],
-            source_mode
-        )
-        if not ta.empty:
-            out["totalAssets"] = float(ta["Value"].iloc[-1])
+    # === Backfill totalDebt (e.g., if yfinance missing) ===
+    # if out.get("totalDebt") is None and es is not None:
+    #     td = load_historical_metrics(
+    #         es, out.get("symbol"),
+    #         ["totalDebt", "shortLongTermDebtTotal", "shortLongTermDebt"],
+    #         source_mode
+    #     )
+    #     if not td.empty:
+    #         out["totalDebt"] = float(td["Value"].iloc[-1])
+
+    # # === Backfill totalAssets ===
+    # if out.get("totalAssets") is None and es is not None:
+    #     ta = load_historical_metrics(
+    #         es, out.get("symbol"),
+    #         ["totalAssets", "TotalAssets"],
+    #         source_mode
+    #     )
+    #     if not ta.empty:
+    #         out["totalAssets"] = float(ta["Value"].iloc[-1])
 
     # 4) Ratios/derivations
     if flags.get("debtToAssets_buildable") and out.get("debtToAssets") is None:
